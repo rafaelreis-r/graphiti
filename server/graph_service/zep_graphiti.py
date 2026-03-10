@@ -1,17 +1,42 @@
 import logging
+import os
 from typing import Annotated
 
 from fastapi import Depends, HTTPException
 from graphiti_core import Graphiti  # type: ignore
 from graphiti_core.edges import EntityEdge  # type: ignore
+from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig  # type: ignore
 from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError, NodeNotFoundError
 from graphiti_core.llm_client import LLMClient  # type: ignore
 from graphiti_core.nodes import EntityNode, EpisodicNode  # type: ignore
+from openai import AsyncOpenAI
 
 from graph_service.config import ZepEnvDep
 from graph_service.dto import FactResult
 
 logger = logging.getLogger(__name__)
+
+# nomic-embed-text dimension
+NOMIC_DIM = 768
+
+
+def _make_embedder(settings):
+    """Create an OpenAI-compatible embedder using EMBEDDING_BASE_URL (or OPENAI_BASE_URL as fallback)."""
+    base_url = settings.embedding_base_url or settings.openai_base_url
+    api_key = settings.openai_api_key or 'ollama'
+    model = settings.embedding_model_name or 'nomic-embed-text'
+
+    if base_url:
+        cfg = OpenAIEmbedderConfig(
+            api_key=api_key,
+            base_url=base_url,
+            embedding_model=model,
+            embedding_dim=NOMIC_DIM,
+        )
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        logger.info(f'Embedder: model={model} dim={NOMIC_DIM} url={base_url}')
+        return OpenAIEmbedder(config=cfg, client=client)
+    return None
 
 
 class ZepGraphiti(Graphiti):
@@ -72,6 +97,7 @@ class ZepGraphiti(Graphiti):
 
 
 async def get_graphiti(settings: ZepEnvDep):
+    embedder = _make_embedder(settings)
     client = ZepGraphiti(
         uri=settings.neo4j_uri,
         user=settings.neo4j_user,
@@ -83,6 +109,8 @@ async def get_graphiti(settings: ZepEnvDep):
         client.llm_client.config.api_key = settings.openai_api_key
     if settings.model_name is not None:
         client.llm_client.model = settings.model_name
+    if embedder is not None:
+        client.embedder = embedder
 
     try:
         yield client
@@ -91,11 +119,14 @@ async def get_graphiti(settings: ZepEnvDep):
 
 
 async def initialize_graphiti(settings: ZepEnvDep):
+    embedder = _make_embedder(settings)
     client = ZepGraphiti(
         uri=settings.neo4j_uri,
         user=settings.neo4j_user,
         password=settings.neo4j_password,
     )
+    if embedder is not None:
+        client.embedder = embedder
     await client.build_indices_and_constraints()
 
 

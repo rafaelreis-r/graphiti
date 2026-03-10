@@ -10,7 +10,10 @@ class Settings(BaseSettings):
     openai_api_key: str
     openai_base_url: str | None = Field(None)
     model_name: str | None = Field(None)
+    small_model_name: str | None = Field(None)
     embedding_model_name: str | None = Field(None)
+    # Separate base URL for embedding model (falls back to openai_base_url)
+    embedding_base_url: str | None = Field(None)
     neo4j_uri: str
     neo4j_user: str
     neo4j_password: str
