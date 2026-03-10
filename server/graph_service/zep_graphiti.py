@@ -27,10 +27,15 @@ NOMIC_DIM = 768
 class NoThinkOpenAIClient(OpenAIClient):
     """OpenAIClient that disables thinking mode for local LLMs like Qwen3.5.
 
-    Injects /no_think into the first system message so that models with
-    built-in chain-of-thought (Qwen3.5, DeepSeek-R1, etc.) skip reasoning
-    and return direct completions — required for Graphiti's structured output.
+    Passes chat_template_kwargs={"enable_thinking": false} via extra_body so that
+    models with built-in chain-of-thought (Qwen3.5, DeepSeek-R1, etc.) skip
+    reasoning and return direct completions — required for Graphiti structured output.
+
+    Also overrides _create_structured_completion to use chat.completions instead of
+    responses.parse (which local llama-server does not support).
     """
+
+    _NO_THINK_EXTRA = {"chat_template_kwargs": {"enable_thinking": False}}
 
     async def _create_completion(
         self,
@@ -38,9 +43,18 @@ class NoThinkOpenAIClient(OpenAIClient):
         messages: list[ChatCompletionMessageParam],
         temperature: float | None,
         max_tokens: int,
+        response_model: type[BaseModel] | None = None,
+        reasoning: str | None = None,
+        verbosity: str | None = None,
     ) -> Any:
-        patched = _inject_no_think(messages)
-        return await super()._create_completion(model, patched, temperature, max_tokens)
+        return await self.client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format={'type': 'json_object'},
+            extra_body=self._NO_THINK_EXTRA,
+        )
 
     async def _create_structured_completion(
         self,
@@ -52,24 +66,17 @@ class NoThinkOpenAIClient(OpenAIClient):
         reasoning: str | None = None,
         verbosity: str | None = None,
     ) -> Any:
-        patched = _inject_no_think(messages)
-        return await super()._create_structured_completion(
-            model, patched, temperature, max_tokens, response_model, reasoning, verbosity
+        # Use chat.completions (not responses.parse) — llama-server doesn't support the
+        # OpenAI Responses API. Return a fake response object that _handle_structured_response
+        # can parse via JSON.
+        return await self.client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format={'type': 'json_object'},
+            extra_body=self._NO_THINK_EXTRA,
         )
-
-
-def _inject_no_think(messages: list[ChatCompletionMessageParam]) -> list[ChatCompletionMessageParam]:
-    """Prepend /no_think to first system message, or insert a system message if none exists."""
-    patched = list(messages)
-    for i, m in enumerate(patched):
-        if isinstance(m, dict) and m.get('role') == 'system':
-            content = m.get('content', '')
-            if isinstance(content, str) and not content.startswith('/no_think'):
-                patched[i] = {**m, 'content': '/no_think\n\n' + content}
-            return patched
-    # No system message found — insert one
-    patched.insert(0, {'role': 'system', 'content': '/no_think'})
-    return patched
 
 
 def _make_llm_client(settings) -> LLMClient:
