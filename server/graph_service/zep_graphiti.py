@@ -9,7 +9,9 @@ from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig  
 from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError, NodeNotFoundError
 from graphiti_core.llm_client import LLMClient  # type: ignore
 from graphiti_core.llm_client.openai_client import OpenAIClient  # type: ignore
-from graphiti_core.llm_client.config import LLMConfig  # type: ignore
+from graphiti_core.llm_client.openai_base_client import DEFAULT_MAX_TOKENS  # type: ignore
+from graphiti_core.llm_client.config import LLMConfig, ModelSize  # type: ignore
+from graphiti_core.prompts.models import Message as LLMMessage  # type: ignore
 from graphiti_core.nodes import EntityNode, EpisodicNode  # type: ignore
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
@@ -25,58 +27,57 @@ NOMIC_DIM = 768
 
 
 class NoThinkOpenAIClient(OpenAIClient):
-    """OpenAIClient that disables thinking mode for local LLMs like Qwen3.5.
+    """OpenAIClient for local thinking models (Qwen3.5, DeepSeek-R1, etc.).
 
-    Passes chat_template_kwargs={"enable_thinking": false} via extra_body so that
-    models with built-in chain-of-thought (Qwen3.5, DeepSeek-R1, etc.) skip
-    reasoning and return direct completions — required for Graphiti structured output.
+    Root cause of ingestion failures:
+      1. response_format=json_object (grammar constraint) + chat_template_kwargs
+         triggers llama-server error 500 "context does not logits computation".
+      2. _create_structured_completion calls responses.parse (OpenAI Responses API)
+         which llama-server does not support at all.
 
-    Also overrides _create_structured_completion to use chat.completions instead of
-    responses.parse (which local llama-server does not support).
+    Fix: override _generate_response to:
+      - use chat.completions.create directly (no grammar, no Responses API)
+      - inject enable_thinking=false via extra_body
+      - always use _handle_json_response (works with ChatCompletion)
     """
 
     _NO_THINK_EXTRA = {"chat_template_kwargs": {"enable_thinking": False}}
 
-    async def _create_completion(
-        self,
-        model: str,
-        messages: list[ChatCompletionMessageParam],
-        temperature: float | None,
-        max_tokens: int,
-        response_model: type[BaseModel] | None = None,
-        reasoning: str | None = None,
-        verbosity: str | None = None,
-    ) -> Any:
+    # These are required by the abstract base but are never reached when
+    # _generate_response is overridden — implemented as thin pass-throughs.
+    async def _create_completion(self, model, messages, temperature, max_tokens,
+                                 response_model=None, reasoning=None, verbosity=None) -> Any:
         return await self.client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={'type': 'json_object'},
-            extra_body=self._NO_THINK_EXTRA,
+            model=model, messages=messages, temperature=temperature,
+            max_tokens=max_tokens, extra_body=self._NO_THINK_EXTRA,
         )
 
-    async def _create_structured_completion(
-        self,
-        model: str,
-        messages: list[ChatCompletionMessageParam],
-        temperature: float | None,
-        max_tokens: int,
-        response_model: type[BaseModel],
-        reasoning: str | None = None,
-        verbosity: str | None = None,
-    ) -> Any:
-        # Use chat.completions (not responses.parse) — llama-server doesn't support the
-        # OpenAI Responses API. Return a fake response object that _handle_structured_response
-        # can parse via JSON.
+    async def _create_structured_completion(self, model, messages, temperature,
+                                            max_tokens, response_model,
+                                            reasoning=None, verbosity=None) -> Any:
         return await self.client.chat.completions.create(
+            model=model, messages=messages, temperature=temperature,
+            max_tokens=max_tokens, extra_body=self._NO_THINK_EXTRA,
+        )
+
+    async def _generate_response(
+        self,
+        messages: list[LLMMessage],
+        response_model: type[BaseModel] | None = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        model_size: ModelSize = ModelSize.medium,
+    ) -> tuple[dict[str, Any], int, int]:
+        """Always use plain chat.completions — no grammar, no Responses API."""
+        openai_messages = self._convert_messages_to_openai_format(messages)
+        model = self._get_model_for_size(model_size)
+        response = await self.client.chat.completions.create(
             model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={'type': 'json_object'},
+            messages=openai_messages,
+            temperature=self.temperature,
+            max_tokens=max_tokens or self.max_tokens,
             extra_body=self._NO_THINK_EXTRA,
         )
+        return self._handle_json_response(response)
 
 
 def _make_llm_client(settings) -> LLMClient:
