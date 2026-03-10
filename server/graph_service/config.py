@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     embedding_model_name: str | None = Field(None)
     # Separate base URL for embedding model (falls back to openai_base_url)
     embedding_base_url: str | None = Field(None)
+    # Set to "true" to inject /no_think into system messages (for Qwen3.5, DeepSeek-R1, etc.)
+    disable_llm_thinking: str | None = Field(None)
     neo4j_uri: str
     neo4j_user: str
     neo4j_password: str

@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException
 from graphiti_core import Graphiti  # type: ignore
@@ -8,8 +8,12 @@ from graphiti_core.edges import EntityEdge  # type: ignore
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig  # type: ignore
 from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError, NodeNotFoundError
 from graphiti_core.llm_client import LLMClient  # type: ignore
+from graphiti_core.llm_client.openai_client import OpenAIClient  # type: ignore
+from graphiti_core.llm_client.config import LLMConfig  # type: ignore
 from graphiti_core.nodes import EntityNode, EpisodicNode  # type: ignore
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionMessageParam
+from pydantic import BaseModel
 
 from graph_service.config import ZepEnvDep
 from graph_service.dto import FactResult
@@ -18,6 +22,67 @@ logger = logging.getLogger(__name__)
 
 # nomic-embed-text dimension
 NOMIC_DIM = 768
+
+
+class NoThinkOpenAIClient(OpenAIClient):
+    """OpenAIClient that disables thinking mode for local LLMs like Qwen3.5.
+
+    Injects /no_think into the first system message so that models with
+    built-in chain-of-thought (Qwen3.5, DeepSeek-R1, etc.) skip reasoning
+    and return direct completions — required for Graphiti's structured output.
+    """
+
+    async def _create_completion(
+        self,
+        model: str,
+        messages: list[ChatCompletionMessageParam],
+        temperature: float | None,
+        max_tokens: int,
+    ) -> Any:
+        patched = _inject_no_think(messages)
+        return await super()._create_completion(model, patched, temperature, max_tokens)
+
+    async def _create_structured_completion(
+        self,
+        model: str,
+        messages: list[ChatCompletionMessageParam],
+        temperature: float | None,
+        max_tokens: int,
+        response_model: type[BaseModel],
+        reasoning: str | None = None,
+        verbosity: str | None = None,
+    ) -> Any:
+        patched = _inject_no_think(messages)
+        return await super()._create_structured_completion(
+            model, patched, temperature, max_tokens, response_model, reasoning, verbosity
+        )
+
+
+def _inject_no_think(messages: list[ChatCompletionMessageParam]) -> list[ChatCompletionMessageParam]:
+    """Prepend /no_think to first system message, or insert a system message if none exists."""
+    patched = list(messages)
+    for i, m in enumerate(patched):
+        if isinstance(m, dict) and m.get('role') == 'system':
+            content = m.get('content', '')
+            if isinstance(content, str) and not content.startswith('/no_think'):
+                patched[i] = {**m, 'content': '/no_think\n\n' + content}
+            return patched
+    # No system message found — insert one
+    patched.insert(0, {'role': 'system', 'content': '/no_think'})
+    return patched
+
+
+def _make_llm_client(settings) -> LLMClient:
+    """Create LLM client — NoThinkOpenAIClient when DISABLE_LLM_THINKING=true."""
+    disable_thinking = os.environ.get('DISABLE_LLM_THINKING', 'false').lower() == 'true'
+    config = LLMConfig(
+        api_key=settings.openai_api_key or 'ollama',
+        base_url=settings.openai_base_url,
+        model=settings.model_name,
+    )
+    client_cls = NoThinkOpenAIClient if disable_thinking else OpenAIClient
+    logger.info(f'LLM client: {client_cls.__name__} model={settings.model_name} url={settings.openai_base_url}')
+    return client_cls(config=config)
 
 
 def _make_embedder(settings):
@@ -97,18 +162,14 @@ class ZepGraphiti(Graphiti):
 
 
 async def get_graphiti(settings: ZepEnvDep):
+    llm_client = _make_llm_client(settings)
     embedder = _make_embedder(settings)
     client = ZepGraphiti(
         uri=settings.neo4j_uri,
         user=settings.neo4j_user,
         password=settings.neo4j_password,
+        llm_client=llm_client,
     )
-    if settings.openai_base_url is not None:
-        client.llm_client.config.base_url = settings.openai_base_url
-    if settings.openai_api_key is not None:
-        client.llm_client.config.api_key = settings.openai_api_key
-    if settings.model_name is not None:
-        client.llm_client.model = settings.model_name
     if embedder is not None:
         client.embedder = embedder
 
@@ -119,11 +180,13 @@ async def get_graphiti(settings: ZepEnvDep):
 
 
 async def initialize_graphiti(settings: ZepEnvDep):
+    llm_client = _make_llm_client(settings)
     embedder = _make_embedder(settings)
     client = ZepGraphiti(
         uri=settings.neo4j_uri,
         user=settings.neo4j_user,
         password=settings.neo4j_password,
+        llm_client=llm_client,
     )
     if embedder is not None:
         client.embedder = embedder
