@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from functools import partial
 
@@ -9,6 +10,8 @@ from graphiti_core.utils.maintenance.graph_data_operations import clear_data  # 
 from graph_service.dto import AddEntityNodeRequest, AddMessagesRequest, Message, Result
 from graph_service.zep_graphiti import ZepGraphitiDep
 
+logger = logging.getLogger(__name__)
+
 
 class AsyncWorker:
     def __init__(self):
@@ -18,11 +21,15 @@ class AsyncWorker:
     async def worker(self):
         while True:
             try:
-                print(f'Got a job: (size of remaining queue: {self.queue.qsize()})')
                 job = await self.queue.get()
+                logger.info(f'Processing job (remaining queue: {self.queue.qsize()})')
                 await job()
+                self.queue.task_done()
             except asyncio.CancelledError:
                 break
+            except Exception as e:
+                # Log and continue — never let a single job crash the worker loop
+                logger.error(f'Worker job failed (will retry next job): {type(e).__name__}: {e}')
 
     async def start(self):
         self.task = asyncio.create_task(self.worker())
