@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from typing import Annotated, Any
@@ -16,6 +17,18 @@ from graphiti_core.nodes import EntityNode, EpisodicNode  # type: ignore
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel
+
+# Global semaphore: local llama-server runs with --parallel 1 (one KV cache slot).
+# Without serialization, concurrent Graphiti LLM calls cause:
+#   - Connection errors (server busy)
+#   - HTTP 500 "context does not logits computation" (KV cache corruption)
+_LOCAL_LLM_SEMAPHORE: asyncio.Semaphore | None = None
+
+def _get_llm_semaphore() -> asyncio.Semaphore:
+    global _LOCAL_LLM_SEMAPHORE
+    if _LOCAL_LLM_SEMAPHORE is None:
+        _LOCAL_LLM_SEMAPHORE = asyncio.Semaphore(1)
+    return _LOCAL_LLM_SEMAPHORE
 
 from graph_service.config import ZepEnvDep
 from graph_service.dto import FactResult
@@ -67,16 +80,23 @@ class NoThinkOpenAIClient(OpenAIClient):
         max_tokens: int = DEFAULT_MAX_TOKENS,
         model_size: ModelSize = ModelSize.medium,
     ) -> tuple[dict[str, Any], int, int]:
-        """Always use plain chat.completions — no grammar, no Responses API."""
+        """Always use plain chat.completions — no grammar, no Responses API.
+
+        Serializes all calls through a global semaphore because local llama-server
+        runs with --parallel 1 and can't handle concurrent requests.
+        """
         openai_messages = self._convert_messages_to_openai_format(messages)
         model = self._get_model_for_size(model_size)
-        response = await self.client.chat.completions.create(
-            model=model,
-            messages=openai_messages,
-            temperature=self.temperature,
-            max_tokens=max_tokens or self.max_tokens,
-            extra_body=self._NO_THINK_EXTRA,
-        )
+
+        async with _get_llm_semaphore():
+            response = await self.client.chat.completions.create(
+                model=model,
+                messages=openai_messages,
+                temperature=self.temperature,
+                max_tokens=max_tokens or self.max_tokens,
+                extra_body=self._NO_THINK_EXTRA,
+            )
+
         # Strip markdown code fences before JSON parsing.
         # Local models (Qwen3.5, Llama, etc.) often wrap output in ```json ... ```
         # which causes json.loads to fail in _handle_json_response.
