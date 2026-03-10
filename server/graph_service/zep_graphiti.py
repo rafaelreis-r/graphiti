@@ -77,7 +77,29 @@ class NoThinkOpenAIClient(OpenAIClient):
             max_tokens=max_tokens or self.max_tokens,
             extra_body=self._NO_THINK_EXTRA,
         )
+        # Strip markdown code fences before JSON parsing.
+        # Local models (Qwen3.5, Llama, etc.) often wrap output in ```json ... ```
+        # which causes json.loads to fail in _handle_json_response.
+        content = response.choices[0].message.content or ''
+        content = _strip_markdown_json(content)
+        response.choices[0].message.content = content
+
         return self._handle_json_response(response)
+
+
+def _strip_markdown_json(text: str) -> str:
+    """Remove markdown code fences from JSON output.
+
+    Converts:  ```json\\n{...}\\n```   →   {...}
+    Also handles: ```\\n{...}\\n```
+    """
+    import re
+    text = text.strip()
+    # Remove opening fence: ```json or ```
+    text = re.sub(r'^```(?:json)?\s*\n?', '', text, flags=re.IGNORECASE)
+    # Remove closing fence
+    text = re.sub(r'\n?```\s*$', '', text)
+    return text.strip()
 
 
 def _make_llm_client(settings) -> LLMClient:
